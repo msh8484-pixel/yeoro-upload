@@ -14,6 +14,8 @@
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif;
     font-size: 17px; line-height: 1.5; -webkit-text-size-adjust: 100%;
+    word-break: keep-all; overflow-wrap: anywhere; /* 한국어를 낱말 가운데서 끊지 않는다 */
+    text-wrap: pretty; /* 마지막 줄에 낱말 하나만 남지 않게(지원하는 브라우저) */
   }
   main { max-width: 480px; margin: 0 auto; padding: 28px 20px calc(32px + env(safe-area-inset-bottom)); }
   .brand { color: var(--amber); font-weight: 700; letter-spacing: 0.08em; font-size: 14px; }
@@ -37,6 +39,10 @@
   .grid li { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: var(--card); }
   .grid img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .grid li.done::after { content: "✓"; position: absolute; right: 4px; bottom: 2px; color: var(--amber); font-weight: 800; text-shadow: 0 0 4px #000; }
+  .grid li.wait, .grid li.more { display: flex; align-items: center; justify-content: center; color: var(--dim); font-size: 14px; }
+  .grid li.wait { border: 1px dashed var(--line); }
+  .grid li b { font-weight: 600; }
+  .grid li.bad b { display: none; }
   .grid li.bad { display: flex; align-items: center; justify-content: center; padding: 4px; text-align: center; font-size: 12px; color: var(--bad); }
   .grid li.bad img { position: absolute; inset: 0; opacity: 0.25; }
   .grid li.bad span { position: relative; }
@@ -56,7 +62,7 @@
   <section id="form" hidden>
     <label class="btn" id="pick">사진 고르기<input id="file" type="file" accept="image/*" multiple></label>
     <button class="btn primary" id="send" type="button" disabled>여로 앨범에 올리기</button>
-    <p class="note">사진 고르기는 나중에 해도 돼요. 이 주소는 30일 동안 열려 있어요.</p>
+    <p class="note">사진 고르기는 나중에 해도 돼요. 이 주소는 30일 동안 열려&nbsp;있어요.</p>
     <p class="note">얼굴 인식 없이 찍은 시각으로만 정리해요.</p>
     <div class="progress" id="progress" hidden>
       <div class="bar"><i id="barFill"></i></div>

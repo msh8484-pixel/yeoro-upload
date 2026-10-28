@@ -5,12 +5,15 @@ import { exifDateTimeOriginal, exifToIso, fitWithin } from "./exif.js";
 const API = "https://dghpdvpkgvamsaidndqa.supabase.co/functions/v1/upload";
 const FULL_MAX = 2048;
 const THUMB_MAX = 720;
+const MAX_TILES = 48; // 미리보기 칸은 이만큼만 그린다(나머지는 "+N장" 한 칸)
+const FRESH_MS = 60_000; // lastModified가 이보다 최근이면 "방금 만든 파일"로 보고 촬영 시각으로 쓰지 않는다
 
 const $ = (id) => document.getElementById(id);
 const token = new URLSearchParams(location.search).get("t") || "";
 let info = null;
 let files = [];
 let busy = false;
+let thumbUrls = []; // 그리드에 보이는 썸네일 object URL (새로 고를 때 revoke)
 
 const MESSAGES = {
   expired: "이 QR은 기간(30일)이 지났어요",
@@ -47,7 +50,12 @@ async function loadInfo() {
   if (res.status === 404) return showError("unknown_token");
   if (res.status === 410) return showError("expired");
   if (!res.ok) return showError("network");
-  info = await res.json();
+  try {
+    info = await res.json();
+  } catch {
+    return showError("network");
+  }
+  if (!info || typeof info !== "object") return showError("network");
   renderHeader();
   $("form").hidden = false;
 }
@@ -68,48 +76,109 @@ async function takenAt(file) {
   } catch {
     // 아래로
   }
-  if (file.lastModified > 0) return { taken_at: localIso(file.lastModified), taken_at_source: "file" };
+  // 방금 만들어진 파일(사진 앱이 고를 때 새로 내보낸 사본 등)의 시각은 촬영 시각이 아니다.
+  const lm = file.lastModified;
+  if (lm > 0 && Math.abs(Date.now() - lm) > FRESH_MS) return { taken_at: localIso(lm), taken_at_source: "file" };
   return { taken_at: "", taken_at_source: "none" };
 }
 
-function toJpeg(bitmap, max, quality) {
-  const size = fitWithin(bitmap.width, bitmap.height, max);
+/** iOS/Safari(WebKit) 버전을 1604(=16.4) 꼴로. WebKit이 아니면 null. */
+function webkitVersion() {
+  const ua = navigator.userAgent;
+  let m = /(?:iPhone|CPU) OS (\d+)_(\d+)/.exec(ua); // iOS는 모든 브라우저가 WebKit
+  if (m) return +m[1] * 100 + +m[2];
+  if (/Chrome\/|Chromium|Firefox\//.test(ua)) return null;
+  m = /Version\/(\d+)\.(\d+).*Safari/.exec(ua);
+  return m ? +m[1] * 100 + +m[2] : null;
+}
+// 옛 WebKit(16.4 이전)의 createImageBitmap은 EXIF 방향을 무시하거나 Blob을 못 받는다 → <img>로 푼다.
+const OLD_WEBKIT = (() => {
+  const v = webkitVersion();
+  return v !== null && v < 1604;
+})();
+
+/** <img>로 풀기: 브라우저가 EXIF 방향을 적용한다(image-orientation 기본값 from-image). */
+async function decodeWithImg(file) {
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.decoding = "async";
+  img.src = url;
+  try {
+    if (img.decode) await img.decode();
+    else await new Promise((ok, bad) => { img.onload = ok; img.onerror = bad; });
+  } catch (e) {
+    URL.revokeObjectURL(url);
+    throw e;
+  }
+  if (!img.naturalWidth || !img.naturalHeight) {
+    URL.revokeObjectURL(url);
+    throw new Error("decode");
+  }
+  return {
+    source: img,
+    width: img.naturalWidth, // 방향이 적용된 크기
+    height: img.naturalHeight,
+    close: () => { img.src = ""; URL.revokeObjectURL(url); },
+  };
+}
+
+/** 사진 풀기 → {source, width, height, close}. 방향은 EXIF대로 적용된 상태. */
+async function decode(file) {
+  if (!OLD_WEBKIT && typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+      return { source: bitmap, width: bitmap.width, height: bitmap.height, close: () => bitmap.close?.() };
+    } catch {
+      // 아래 <img> 경로로
+    }
+  }
+  return decodeWithImg(file);
+}
+
+function toJpeg(img, max, quality) {
+  const size = fitWithin(img.width, img.height, max);
   const canvas = document.createElement("canvas");
   canvas.width = size.w;
   canvas.height = size.h;
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(bitmap, 0, 0, size.w, size.h);
+  ctx.drawImage(img.source, 0, 0, size.w, size.h);
   return new Promise((resolve, reject) =>
-    canvas.toBlob((b) => (b ? resolve({ blob: b, ...size }) : reject(new Error("toBlob"))), "image/jpeg", quality)
+    canvas.toBlob((b) => {
+      canvas.width = canvas.height = 0; // iOS 캔버스 메모리를 바로 돌려준다
+      if (b) resolve({ blob: b, ...size });
+      else reject(new Error("toBlob"));
+    }, "image/jpeg", quality)
   );
 }
 
-/** 사진 한 장 → {photo, thumb, w, h} 또는 null(열 수 없음) */
+/** 사진 한 장 → {photo, thumb, w, h} 또는 null(열 수 없음). w·h는 방향이 적용된 2048px 결과의 크기. */
 async function prepare(file) {
-  let bitmap;
+  let img;
   try {
-    bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+    img = await decode(file);
   } catch {
     return null;
   }
   try {
-    const full = await toJpeg(bitmap, FULL_MAX, 0.85);
-    const thumb = await toJpeg(bitmap, THUMB_MAX, 0.8);
+    const full = await toJpeg(img, FULL_MAX, 0.85);
+    const thumb = await toJpeg(img, THUMB_MAX, 0.8);
     return { photo: full.blob, thumb: thumb.blob, w: full.w, h: full.h };
   } catch {
     return null;
   } finally {
-    bitmap.close?.();
+    img.close();
   }
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 한 장 보내기. 결과: "ok" | "bad" | "failed" | 멈춤 코드(expired, unknown_token, photo_limit) */
-async function send(file) {
+async function send(entry) {
+  const file = entry.file;
   const ready = await prepare(file);
   if (!ready) return "bad";
+  showThumb(entry, ready.thumb);
   const time = await takenAt(file);
   for (let attempt = 0; attempt < 4; attempt++) {
     const form = new FormData();
@@ -146,20 +215,46 @@ async function send(file) {
   return "failed";
 }
 
+// 미리보기: 원본을 풀지 않는다. 처음에는 번호만 있는 빈 칸, 올리면서 만든 720px 썸네일로 바꾼다.
 function renderGrid() {
-  const grid = $("grid");
-  grid.replaceChildren(...files.map((f) => {
+  const shown = files.length > MAX_TILES ? MAX_TILES - 1 : files.length;
+  const tiles = files.slice(0, shown).map((f, k) => {
     const li = document.createElement("li");
-    const img = document.createElement("img");
-    img.alt = "";
-    img.src = f.preview;
-    li.append(img);
+    li.className = "wait";
+    const n = document.createElement("b");
+    n.textContent = String(k + 1);
+    li.append(n);
     f.el = li;
     return li;
-  }));
+  });
+  if (shown < files.length) {
+    const more = document.createElement("li");
+    more.className = "more";
+    more.textContent = `+${files.length - shown}장`;
+    tiles.push(more);
+  }
+  $("grid").replaceChildren(...tiles);
+}
+
+function showThumb(f, blob) {
+  if (!f.el) return;
+  const url = URL.createObjectURL(blob);
+  thumbUrls.push(url);
+  const img = document.createElement("img");
+  img.alt = "";
+  img.src = url;
+  f.el.className = "";
+  f.el.replaceChildren(img);
+}
+
+function clearFiles() {
+  for (const url of thumbUrls) URL.revokeObjectURL(url);
+  thumbUrls = [];
+  files = [];
 }
 
 function mark(f, state) {
+  if (!f.el) return;
   f.el.className = state;
   if (state === "bad" || state === "failed") {
     const span = document.createElement("span");
@@ -176,8 +271,9 @@ function progress(done, total) {
 }
 
 $("file").addEventListener("change", (e) => {
-  for (const f of files) URL.revokeObjectURL(f.preview);
-  files = [...e.target.files].map((file) => ({ file, preview: URL.createObjectURL(file) }));
+  if (busy) return;
+  clearFiles();
+  files = [...e.target.files].map((file) => ({ file, el: null }));
   $("done").hidden = true;
   $("progress").hidden = true;
   renderGrid();
@@ -195,7 +291,7 @@ $("send").addEventListener("click", async () => {
   let stop = null;
   progress(0, total);
   for (let k = 0; k < total; k++) {
-    const result = await send(files[k].file);
+    const result = await send(files[k]);
     if (result === "ok") sent++;
     if (result === "ok" || result === "bad" || result === "failed") {
       mark(files[k], result === "ok" ? "done" : result);
@@ -207,6 +303,7 @@ $("send").addEventListener("click", async () => {
     break;
   }
   busy = false;
+  $("file").value = ""; // 같은 사진을 다시 골라도 change가 일어나게
   if (stop) return showError(stop);
   $("done").textContent = sent === total
     ? `${total}장 모두 보냈어요. 차가 앨범의 제자리에 넣을게요.`
@@ -214,7 +311,8 @@ $("send").addEventListener("click", async () => {
   $("done").hidden = false;
   $("pick").hidden = false;
   $("send").textContent = "여로 앨범에 올리기";
-  files = [];
+  files = []; // 썸네일은 그리드에 남겨 두고, URL은 다음에 고를 때 revoke한다
+
 });
 
 loadInfo();

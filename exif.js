@@ -119,8 +119,20 @@ export function exifToIso(e, defaultOffset = "+09:00") {
   if (!m) return null;
   const [, y, mo, d, h, mi, s] = m;
   if (+y < 1900 || +mo < 1 || +mo > 12 || +d < 1 || +d > 31 || +h > 23 || +mi > 59 || +s > 59) return null;
-  const offset = e.offset && OFFSET_RE.test(e.offset) ? e.offset : defaultOffset;
+  // 2026:02:31 같은 없는 날짜: 그 달의 날짜로 되돌아오는지(왕복) 확인한다.
+  const day = new Date(Date.UTC(+y, +mo - 1, +d));
+  if (day.getUTCFullYear() !== +y || day.getUTCMonth() !== +mo - 1 || day.getUTCDate() !== +d) return null;
+  const offset = validOffset(e.offset) ? e.offset : defaultOffset;
+  if (!validOffset(offset)) return null;
   return `${y}-${mo}-${d}T${h}:${mi}:${s}${offset}`;
+}
+
+/** "+09:00" 형식이고 실제로 있을 수 있는 범위(±14:00 이내, 분 < 60)인지. */
+function validOffset(o) {
+  if (typeof o !== "string" || !OFFSET_RE.test(o)) return false;
+  const hh = +o.slice(1, 3);
+  const mm = +o.slice(4, 6);
+  return mm < 60 && hh * 60 + mm <= 14 * 60;
 }
 
 /**
