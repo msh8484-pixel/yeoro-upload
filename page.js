@@ -2,6 +2,7 @@
 // 고르면 바로 보낸다: 사진을 한 장씩 풀어(메모리) 2048px·720px JPEG과 칸에 보일 작은 그림을 만들고,
 // 세 장씩 동시에 올린다. 서버 제한(토큰당 1분에 30장)은 미리 맞춰 쉬고, 그래도 걸리면 기다렸다가 다시 보낸다.
 // 다시 고르면 지금 고른 사진 뒤에 붙는다(바꾸지 않는다).
+// 보낸 사진은 칸의 ✕로 다시 뺄 수 있다: 서버가 201로 준 지우기 열쇠(delete_key)를 메모리와 localStorage에 둔다.
 import { exifDateTimeOriginal, exifToIso, fitWithin } from "./exif.js";
 
 const API = "https://dghpdvpkgvamsaidndqa.supabase.co/functions/v1/upload";
@@ -18,6 +19,8 @@ const RETRIES = 2; // 일시 오류(연결 끊김·5xx)는 두 번 더 해 본�
 const RETRY_DELAYS = [2_000, 6_000];
 const BUFFER_BYTES = 40 * 1024 * 1024; // 만들어 두고 아직 못 보낸 JPEG의 합 상한(휴대폰 메모리)
 const XHR_TIMEOUT_MS = 120_000;
+const DEL_PREFIX = "yeoro.del."; // localStorage: yeoro.del.<token>.<photo id> → {"k": 지우기 열쇠, "at": ms}
+const DEL_KEEP_MS = 40 * 24 * 3_600_000; // 링크는 30일 열려 있다. 그보다 오래된 열쇠는 버린다
 const FRESH_MS = 60_000; // lastModified가 이보다 최근이면 "방금 만든 파일"로 보고 촬영 시각으로 쓰지 않는다
 
 const $ = (id) => document.getElementById(id);
@@ -26,7 +29,7 @@ const uploadUrl = `${API}?t=${encodeURIComponent(token)}`;
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 let info = null;
-/** @type {Array<{n:number,file:File,key:string,state:string,ready:any,bytes:number,progress:number,tries:number,rateHits:number,el:HTMLElement,xhr:XMLHttpRequest|null}>} */
+/** @type {Array<{n:number,file:File,key:string,state:string,ready:any,bytes:number,progress:number,tries:number,rateHits:number,el:HTMLElement,xhr:XMLHttpRequest|null,photoId?:string,deleteKey?:string,deleting?:boolean}>} */
 const items = [];
 let seq = 0;
 let active = 0; // 올리는 중인 XHR 수
@@ -336,6 +339,13 @@ async function send(it) {
     setState(it, "done");
     info.count = body && typeof body.count === "number" ? body.count : info.count + 1;
     renderCount(true);
+    if (body && typeof body.id === "string" && typeof body.delete_key === "string") {
+      it.photoId = body.id;
+      it.deleteKey = body.delete_key;
+      rememberKey(it.photoId, it.deleteKey);
+      it.el.parentNode.classList.add("can-del");
+      $("undo").hidden = false;
+    }
   } else if (status === 404 || status === 410) {
     return stop(status === 404 ? "unknown_token" : "expired");
   } else if (status === 415 || status === 413) {
@@ -480,7 +490,13 @@ function makeTile(it) {
     '<span class="badge" aria-hidden="true"></span>';
   if (!reduceMotion) b.style.animationDelay = `${Math.min(items.length % 12, 11) * 25}ms`;
   b.addEventListener("click", () => retry(it));
-  li.append(b);
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "del";
+  del.setAttribute("aria-label", `사진 ${it.n} 빼기`);
+  del.innerHTML = '<span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/></svg></span>';
+  del.addEventListener("click", () => askDelete(it));
+  li.append(b, del);
   return b;
 }
 
@@ -525,6 +541,167 @@ function setProgress(it, f) {
 function setRing(it, f) {
   const arc = it.el.querySelector(".arc");
   arc.style.strokeDashoffset = String(RING_C * (1 - Math.max(0, Math.min(1, f))));
+}
+
+// ---------- 보낸 사진 빼기 ----------
+
+function rememberKey(id, key) {
+  try {
+    localStorage.setItem(`${DEL_PREFIX}${token}.${id}`, JSON.stringify({ k: key, at: Date.now() }));
+  } catch {
+    // 저장소가 없거나 막혀 있어도 이 화면이 열려 있는 동안은 뺄 수 있다
+  }
+}
+
+function forgetKey(id) {
+  try {
+    localStorage.removeItem(`${DEL_PREFIX}${token}.${id}`);
+  } catch {
+    // 무시
+  }
+}
+
+function storedKey(id) {
+  try {
+    const v = JSON.parse(localStorage.getItem(`${DEL_PREFIX}${token}.${id}`) || "null");
+    return v && typeof v.k === "string" ? v.k : "";
+  } catch {
+    return "";
+  }
+}
+
+/** 링크 기간이 지나 쓸 일이 없는 열쇠를 지운다 */
+function pruneKeys() {
+  try {
+    const now = Date.now();
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(DEL_PREFIX)) continue;
+      let at = 0;
+      try {
+        at = Number(JSON.parse(localStorage.getItem(k) || "{}").at) || 0;
+      } catch {
+        at = 0;
+      }
+      if (!(now - at < DEL_KEEP_MS)) localStorage.removeItem(k);
+    }
+  } catch {
+    // 무시
+  }
+}
+
+let asking = null; // 지금 "뺄까요?"를 묻고 있는 사진
+
+function closeAsk() {
+  if (!asking) return;
+  const li = asking.el.parentNode;
+  li.classList.remove("asking");
+  li.querySelector(".confirm")?.remove();
+  asking = null;
+}
+
+function askDelete(it) {
+  if (it.deleting || it.state !== "done") return;
+  closeAsk();
+  asking = it;
+  const li = it.el.parentNode;
+  li.classList.add("asking");
+  const box = document.createElement("div");
+  box.className = "confirm";
+  box.setAttribute("role", "alertdialog");
+  box.setAttribute("aria-label", "이 사진을 뺄까요?");
+  box.innerHTML = '<p>이 사진을<br>뺄까요?</p><div class="row"><button type="button" class="yes">빼기</button><button type="button" class="no">취소</button></div>';
+  box.querySelector(".yes").addEventListener("click", () => removePhoto(it, box));
+  box.querySelector(".no").addEventListener("click", () => {
+    closeAsk();
+    li.querySelector(".del")?.focus();
+  });
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeAsk();
+  });
+  li.append(box);
+  box.querySelector(".no").focus({ preventScroll: true });
+}
+
+async function removePhoto(it, box) {
+  if (it.deleting) return;
+  const key = it.deleteKey || storedKey(it.photoId);
+  it.deleting = true;
+  box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  box.querySelector("p").textContent = "빼는 중…";
+  let status = 0;
+  try {
+    const res = await fetch(`${uploadUrl}&id=${encodeURIComponent(it.photoId)}`, {
+      method: "DELETE",
+      headers: { "x-yeoro-delete": key },
+      cache: "no-store",
+    });
+    status = res.status;
+  } catch {
+    status = 0;
+  }
+  it.deleting = false;
+  if (status === 204 || status === 404) { // 404: 차에서 이미 뺐다
+    closeAsk();
+    forgetKey(it.photoId);
+    if (info.count > 0) info.count--;
+    renderCount(true);
+    dropTile(it);
+    toast("사진을 뺐어요.");
+    return;
+  }
+  closeAsk();
+  if (status === 410) toast("이 링크는 기간이 지나서 여기서는 뺄 수 없어요. 차에서 빼 주세요.", 4200);
+  else if (status === 403) toast("이 사진은 여기서 뺄 수 없어요. 차에서 빼 주세요.", 4200);
+  else toast("빼지 못했어요. 인터넷 연결을 확인하고 다시 눌러 주세요.", 4200);
+}
+
+/** 칸을 작게 줄이며 없애고, 뒤 칸들은 제자리로 미끄러지게 한다(FLIP). */
+function dropTile(it) {
+  const li = it.el.parentNode;
+  const after = [];
+  for (let n = li.nextElementSibling; n; n = n.nextElementSibling) after.push(n);
+  const finish = () => {
+    const before = after.map((n) => n.getBoundingClientRect());
+    li.remove();
+    const i = items.indexOf(it);
+    if (i >= 0) items.splice(i, 1);
+    if (!reduceMotion) {
+      after.forEach((n, k) => {
+        const r = n.getBoundingClientRect();
+        const dx = before[k].left - r.left;
+        const dy = before[k].top - r.top;
+        if (!dx && !dy) return;
+        n.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }], { duration: 280, easing: "cubic-bezier(.2, .8, .2, 1)" });
+      });
+    }
+    afterRemoval();
+  };
+  if (reduceMotion) return finish();
+  li.classList.add("leaving");
+  const onEnd = (e) => {
+    if (e.target !== li) return; // 안쪽 칸의 움직임이 끝난 것은 건너뛴다
+    li.removeEventListener("animationend", onEnd);
+    finish();
+  };
+  li.addEventListener("animationend", onEnd);
+}
+
+function afterRemoval() {
+  $("undo").hidden = !items.some((i) => i.deleteKey);
+  if (!items.length) {
+    // 다 뺐다: 처음 화면으로
+    $("status").hidden = true;
+    $("finish").hidden = true;
+    finishedShown = false;
+    $("empty").hidden = false;
+    $("lead").hidden = false;
+    $("pickLabel").textContent = "사진 고르기";
+    return;
+  }
+  if (!isBusy() && !$("finish").hidden) {
+    showFinish({ done: count("done"), bad: count("bad"), noroom: count("noroom"), failed: count("failed") }, true);
+  }
 }
 
 // ---------- 위 진행 상황 · 끝 ----------
@@ -601,7 +778,7 @@ function updateStatus() {
 const CHECK_SVG = '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const ALERT_SVG = '<svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-function showFinish({ done, bad, noroom, failed }) {
+function showFinish({ done, bad, noroom, failed }, quiet = false) {
   const box = $("finish");
   const extra = [];
   if (bad) extra.push(`열 수 없는 사진 ${bad}장은 빼고 보냈어요.`);
@@ -619,6 +796,7 @@ function showFinish({ done, bad, noroom, failed }) {
       : extra.join(" ") || "다른 사진을 골라 주세요.";
   }
   $("retryAll").hidden = failed === 0;
+  if (quiet) return; // 사진을 뺀 뒤 글만 고친다(다시 튀어나오지 않게)
   box.querySelectorAll(".spark").forEach((s) => s.remove());
   if (!failed && done && !reduceMotion) sparkle(box);
   box.hidden = false;
@@ -747,4 +925,5 @@ addEventListener("beforeunload", (e) => {
 
 $("reload").addEventListener("click", () => location.reload());
 
+pruneKeys();
 loadInfo();

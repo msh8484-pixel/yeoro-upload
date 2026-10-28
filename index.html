@@ -129,6 +129,40 @@
   .tile.failed .badge span.icon { width: 34px; height: 34px; border-radius: 50%; background: rgba(255, 255, 255, 0.16); display: grid; place-items: center; }
   .tile:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; }
 
+  /* 지우기: 보낸 칸의 ✕ → 칸 위에서 바로 묻기 */
+  .grid > li { position: relative; }
+  .del {
+    position: absolute; top: 0; right: 0; z-index: 2; width: 44px; height: 44px; padding: 0; border: 0; background: none;
+    display: grid; place-items: center; cursor: pointer; opacity: 0; transform: scale(.5); pointer-events: none;
+    transition: opacity .2s var(--ease), transform .3s cubic-bezier(.3, 1.6, .5, 1);
+  }
+  .del span {
+    width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: #fff;
+    background: rgba(10, 13, 24, 0.66); border: 1px solid rgba(255, 255, 255, 0.32);
+    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  }
+  .del:active span { transform: scale(.9); }
+  .del:focus-visible { outline: none; }
+  .del:focus-visible span { outline: 3px solid var(--amber); outline-offset: 1px; }
+  .grid > li.can-del .del { opacity: 1; transform: none; pointer-events: auto; }
+  .grid > li.asking .del { opacity: 0; pointer-events: none; }
+  .confirm {
+    position: absolute; inset: 0; z-index: 3; border-radius: 14px; padding: 8px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px;
+    background: rgba(10, 13, 24, 0.84); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
+    border: 1px solid rgba(255, 154, 142, 0.35); animation: fadeIn .18s var(--ease) both;
+  }
+  .confirm p { margin: 0; font-size: 14px; font-weight: 800; line-height: 1.3; text-align: center; color: var(--text); }
+  .confirm .row { display: flex; gap: 6px; width: 100%; }
+  .confirm button { flex: 1; min-height: 40px; padding: 0; border: 0; border-radius: 10px; font-size: 14px; font-weight: 800; cursor: pointer; }
+  .confirm .yes { background: var(--bad); color: #2A0D09; }
+  .confirm .no { background: rgba(255, 255, 255, 0.12); color: var(--text); }
+  .confirm button:disabled { opacity: .5; cursor: default; }
+  .confirm button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .grid > li.leaving { animation: tileOut .32s var(--ease) forwards; pointer-events: none; }
+  .undo { margin: -6px 4px 18px; color: var(--dim); font-size: 14px; line-height: 1.5; display: flex; gap: 8px; }
+  .undo svg { flex: none; margin-top: 3px; color: var(--faint); }
+
   /* 처음 화면: 빈 앨범 */
   .empty {
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 14px; margin: 0 0 18px;
@@ -200,6 +234,8 @@
   @keyframes tileIn { from { opacity: 0; transform: scale(.92); } to { opacity: 1; transform: none; } }
   @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
   @keyframes pop { from { opacity: 0; transform: scale(.3); } to { opacity: 1; transform: none; } }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes tileOut { to { opacity: 0; transform: scale(.55); } }
   @keyframes bump { 40% { transform: scale(1.08); } }
   @keyframes spark { 0% { opacity: 0; transform: translate(0, 0) rotate(0); } 25% { opacity: 1; } 100% { opacity: 0; transform: translate(var(--dx), var(--dy)) rotate(200deg); } }
   @media (prefers-reduced-motion: reduce) {
@@ -256,7 +292,10 @@
       <p>고른 사진이 여기에 앨범처럼 모여요</p>
     </div>
     <ul class="grid" id="grid" aria-label="고른 사진"></ul>
-
+    <p class="undo" id="undo" hidden>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="9.5" stroke="currentColor" stroke-width="2"/><path d="M12 11v6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.3" fill="currentColor"/></svg>
+      <span>잘못 올렸으면 사진의 ✕를 눌러 빼세요. 다른 가족이 올린 사진은 차에서 뺄 수 있어요.</span>
+    </p>
 
     <section class="share">
       <h3>함께 간 가족도 올릴 수 있어요</h3>
