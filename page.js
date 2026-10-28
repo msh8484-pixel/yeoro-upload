@@ -1,49 +1,97 @@
 // 여로 사진 올리기 페이지 (정적, 키 없음). 차의 도착 카드 QR → upload 함수 302 → 이 페이지(?t=토큰).
-// 사진마다 EXIF 촬영 시각(없으면 파일 시각)을 읽고, 2048px·720px 두 장으로 줄여 한 장씩 보낸다.
+// 고르면 바로 보낸다: 사진을 한 장씩 풀어(메모리) 2048px·720px JPEG과 칸에 보일 작은 그림을 만들고,
+// 세 장씩 동시에 올린다. 서버 제한(토큰당 1분에 30장)은 미리 맞춰 쉬고, 그래도 걸리면 기다렸다가 다시 보낸다.
+// 다시 고르면 지금 고른 사진 뒤에 붙는다(바꾸지 않는다).
 import { exifDateTimeOriginal, exifToIso, fitWithin } from "./exif.js";
 
 const API = "https://dghpdvpkgvamsaidndqa.supabase.co/functions/v1/upload";
 const FULL_MAX = 2048;
 const THUMB_MAX = 720;
-const MAX_TILES = 48; // 미리보기 칸은 이만큼만 그린다(나머지는 "+N장" 한 칸)
+const TILE_MAX = 300; // 칸에 보이는 그림(작게 따로 만들어 원본·720px을 오래 들고 있지 않는다)
+const PARALLEL = 3;
+const RATE_LIMIT = 30; // 서버: 토큰당 최근 60초에 30장
+const RATE_WINDOW_MS = 60_000;
+const RATE_MARGIN_MS = 1_500;
+const SERVER_HOLD_MS = 20_000; // 그래도 rate_limited(다른 가족이 같이 올리는 중)면 이만큼 쉬고 다시
+const MAX_RATE_HITS = 12;
+const RETRIES = 2; // 일시 오류(연결 끊김·5xx)는 두 번 더 해 본다
+const RETRY_DELAYS = [2_000, 6_000];
+const BUFFER_BYTES = 40 * 1024 * 1024; // 만들어 두고 아직 못 보낸 JPEG의 합 상한(휴대폰 메모리)
+const XHR_TIMEOUT_MS = 120_000;
 const FRESH_MS = 60_000; // lastModified가 이보다 최근이면 "방금 만든 파일"로 보고 촬영 시각으로 쓰지 않는다
 
 const $ = (id) => document.getElementById(id);
 const token = new URLSearchParams(location.search).get("t") || "";
-let info = null;
-let files = [];
-let busy = false;
-let thumbUrls = []; // 그리드에 보이는 썸네일 object URL (새로 고를 때 revoke)
+const uploadUrl = `${API}?t=${encodeURIComponent(token)}`;
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-const MESSAGES = {
-  expired: "이 QR은 기간(30일)이 지났어요",
-  unknown_token: "이 QR은 여로에 등록되지 않았어요. 차의 카드에 있는 QR을 다시 찍어 주세요.",
-  photo_limit: "이 여행에는 사진을 200장까지 올릴 수 있어요. 더는 올릴 수 없어요.",
-  network: "인터넷에 연결되지 않았어요. 잠시 뒤에 다시 열어 주세요.",
+let info = null;
+/** @type {Array<{n:number,file:File,key:string,state:string,ready:any,bytes:number,progress:number,tries:number,rateHits:number,el:HTMLElement,xhr:XMLHttpRequest|null}>} */
+const items = [];
+let seq = 0;
+let active = 0; // 올리는 중인 XHR 수
+let sentAt = []; // 201을 받은 시각들(1분 창 계산)
+let holdUntil = 0; // 서버가 rate_limited를 준 뒤 쉬는 끝 시각
+let pumpTimer = 0;
+let tickTimer = 0;
+let preparing = false;
+let stopped = null; // 멈춤 코드(expired·unknown_token)
+let finishedShown = false;
+
+// ---------- 시작: 여행 정보 ----------
+
+const ERRORS = {
+  expired: ["이 QR은 기간(30일)이 지났어요", "여행 사진은 차의 앨범에 그대로 남아 있어요."],
+  unknown_token: ["이 QR은 여로에 등록되지 않았어요", "차의 카드에 있는 QR을 다시 찍어 주세요."],
+  network: ["인터넷에 연결되지 않았어요", "잠시 뒤에 다시 열어 주세요."],
+  full: ["이 여행 앨범이 가득 찼어요", "이 여행에는 사진을 200장까지 올릴 수 있어요."],
 };
 
 function showError(code) {
-  $("sub").hidden = true;
-  $("form").hidden = true;
-  $("error").textContent = MESSAGES[code] || MESSAGES.network;
+  const [title, body] = ERRORS[code] || ERRORS.network;
+  $("errorTitle").textContent = title;
+  $("errorBody").textContent = body;
+  $("reload").hidden = code !== "network";
   $("error").hidden = false;
+  $("app").hidden = true;
+  $("dock").hidden = true;
+  if (!info) $("trip").hidden = true;
+  releaseWakeLock();
 }
 
 function koreanDate(ymd) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || "");
-  return m ? `${+m[1]}년 ${+m[2]}월 ${+m[3]}일 여행` : "여행";
+  if (!m) return "";
+  const day = "일월화수목금토"[new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).getUTCDay()];
+  return `${+m[1]}년 ${+m[2]}월 ${+m[3]}일 ${day}요일`;
 }
 
-function renderHeader() {
-  $("title").textContent = `${info.dest_name || "여행"} 사진 올리기`;
-  $("sub").textContent = `${koreanDate(info.started_on)} · 지금까지 ${info.count}장`;
+function renderTrip() {
+  $("trip").classList.remove("skeleton");
+  $("dest").textContent = info.dest_name || "우리 가족 여행";
+  $("date").textContent = koreanDate(info.started_on) || "여행";
+  renderCount(false);
+  const exp = new Date(info.expires_at || "");
+  if (!isNaN(exp)) $("expiry").textContent = `이 링크는 ${exp.getMonth() + 1}월 ${exp.getDate()}일까지 열려 있어요.`;
+  document.title = `${info.dest_name || "여행"} 사진 올리기 · 여로`;
+}
+
+function renderCount(bump) {
+  $("count").hidden = false;
+  $("countText").textContent = `지금까지 ${info.count}장`;
+  if (bump && !reduceMotion) {
+    const c = $("count");
+    c.classList.remove("bump");
+    void c.offsetWidth;
+    c.classList.add("bump");
+  }
 }
 
 async function loadInfo() {
   if (!/^[A-Za-z0-9_-]{22}$/.test(token)) return showError("unknown_token");
   let res;
   try {
-    res = await fetch(`${API}?t=${encodeURIComponent(token)}&info=1`, { cache: "no-store" });
+    res = await fetch(`${uploadUrl}&info=1`, { cache: "no-store" });
   } catch {
     return showError("network");
   }
@@ -56,9 +104,15 @@ async function loadInfo() {
     return showError("network");
   }
   if (!info || typeof info !== "object") return showError("network");
-  renderHeader();
-  $("form").hidden = false;
+  info.count = Number(info.count) || 0;
+  info.max = Number(info.max) || 200;
+  renderTrip();
+  if (info.count >= info.max) return showError("full");
+  $("app").hidden = false;
+  $("dock").hidden = false;
 }
+
+// ---------- 사진 준비 (한 장씩) ----------
 
 /** 휴대폰 지역 시각을 오프셋이 붙은 ISO로: 2026-10-31T13:30:00+09:00 */
 function localIso(ms) {
@@ -152,7 +206,7 @@ function toJpeg(img, max, quality) {
   );
 }
 
-/** 사진 한 장 → {photo, thumb, w, h} 또는 null(열 수 없음). w·h는 방향이 적용된 2048px 결과의 크기. */
+/** 사진 한 장 → {photo, thumb, tile, w, h, time} 또는 null(열 수 없음). w·h는 방향이 적용된 2048px 결과의 크기. */
 async function prepare(file) {
   let img;
   try {
@@ -163,7 +217,8 @@ async function prepare(file) {
   try {
     const full = await toJpeg(img, FULL_MAX, 0.85);
     const thumb = await toJpeg(img, THUMB_MAX, 0.8);
-    return { photo: full.blob, thumb: thumb.blob, w: full.w, h: full.h };
+    const tile = await toJpeg(img, TILE_MAX, 0.72);
+    return { photo: full.blob, thumb: thumb.blob, tile: tile.blob, w: full.w, h: full.h, time: await takenAt(file) };
   } catch {
     return null;
   } finally {
@@ -171,148 +226,525 @@ async function prepare(file) {
   }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const buffered = () => items.reduce((s, it) => s + (it.ready ? it.bytes : 0), 0);
 
-/** 한 장 보내기. 결과: "ok" | "bad" | "failed" | 멈춤 코드(expired, unknown_token, photo_limit) */
-async function send(entry) {
-  const file = entry.file;
-  const ready = await prepare(file);
-  if (!ready) return "bad";
-  showThumb(entry, ready.thumb);
-  const time = await takenAt(file);
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const form = new FormData();
-    form.append("photo", ready.photo, "photo.jpg");
-    form.append("thumb", ready.thumb, "thumb.jpg");
-    form.append("w", String(ready.w));
-    form.append("h", String(ready.h));
-    if (time.taken_at) form.append("taken_at", time.taken_at);
-    form.append("taken_at_source", time.taken_at_source);
-    let res;
-    try {
-      res = await fetch(`${API}?t=${encodeURIComponent(token)}`, { method: "POST", body: form });
-    } catch {
-      await sleep(2000);
-      continue;
+async function prepLoop() {
+  if (preparing) return;
+  preparing = true;
+  try {
+    while (!stopped && buffered() < BUFFER_BYTES) {
+      const it = items.find((i) => i.state === "queued");
+      if (!it) break;
+      setState(it, "preparing");
+      updateStatus();
+      const ready = await prepare(it.file);
+      if (stopped) break;
+      if (!ready) {
+        setState(it, "bad");
+        continue;
+      }
+      showTile(it, ready.tile);
+      ready.tile = null;
+      it.ready = ready;
+      it.bytes = ready.photo.size + ready.thumb.size;
+      if (it.state === "preparing") setState(it, "ready");
+      pump();
+      await new Promise((r) => setTimeout(r, 0)); // 화면이 그릴 틈
     }
-    if (res.status === 201) {
-      const body = await res.json().catch(() => null);
-      if (body && typeof body.count === "number") info.count = body.count;
-      else info.count += 1;
-      return "ok";
-    }
-    if (res.status === 404) return "unknown_token";
-    if (res.status === 410) return "expired";
-    if (res.status === 415) return "bad";
-    const body = await res.json().catch(() => ({}));
-    if (body.error === "photo_limit") return "photo_limit";
-    if (body.error === "rate_limited") {
-      await sleep(30000); // 1분에 30장 제한: 잠시 쉬고 다시
-      continue;
-    }
-    return "failed";
+  } finally {
+    preparing = false;
   }
-  return "failed";
+  updateStatus();
 }
 
-// 미리보기: 원본을 풀지 않는다. 처음에는 번호만 있는 빈 칸, 올리면서 만든 720px 썸네일로 바꾼다.
-function renderGrid() {
-  const shown = files.length > MAX_TILES ? MAX_TILES - 1 : files.length;
-  const tiles = files.slice(0, shown).map((f, k) => {
-    const li = document.createElement("li");
-    li.className = "wait";
-    const n = document.createElement("b");
-    n.textContent = String(k + 1);
-    li.append(n);
-    f.el = li;
-    return li;
+// ---------- 보내기 (세 장씩, 1분 30장 맞추기) ----------
+
+/** 지금 하나 더 보내도 되면 0, 아니면 기다릴 ms */
+function rateWait() {
+  const now = Date.now();
+  if (holdUntil > now) return holdUntil - now;
+  sentAt = sentAt.filter((t) => now - t < RATE_WINDOW_MS + RATE_MARGIN_MS);
+  const used = sentAt.length + active;
+  if (used < RATE_LIMIT) return 0;
+  const k = used - RATE_LIMIT; // 이 번째로 오래된 기록이 창을 벗어나야 한 자리가 난다
+  if (k >= sentAt.length) return 1_000;
+  return Math.max(250, sentAt[k] + RATE_WINDOW_MS + RATE_MARGIN_MS - now);
+}
+
+function pump() {
+  clearTimeout(pumpTimer);
+  pumpTimer = 0;
+  if (stopped) return;
+  while (active < PARALLEL) {
+    const it = items.find((i) => i.state === "ready");
+    if (!it) break;
+    const wait = rateWait();
+    if (wait > 0) {
+      pumpTimer = setTimeout(pump, wait);
+      break;
+    }
+    send(it);
+  }
+  updateStatus();
+}
+
+function post(it, form) {
+  return new Promise((resolve) => {
+    const x = new XMLHttpRequest();
+    it.xhr = x;
+    x.open("POST", uploadUrl);
+    x.timeout = XHR_TIMEOUT_MS;
+    x.upload.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) setProgress(it, e.loaded / e.total);
+    };
+    x.onload = () => {
+      let body = null;
+      try {
+        body = JSON.parse(x.responseText);
+      } catch {
+        // 본문 없음
+      }
+      resolve({ status: x.status, body });
+    };
+    x.onerror = x.ontimeout = x.onabort = () => resolve({ status: 0, body: null });
+    x.send(form);
   });
-  if (shown < files.length) {
-    const more = document.createElement("li");
-    more.className = "more";
-    more.textContent = `+${files.length - shown}장`;
-    tiles.push(more);
+}
+
+async function send(it) {
+  active++;
+  setState(it, "uploading");
+  setProgress(it, 0);
+  const r = it.ready;
+  const form = new FormData();
+  form.append("photo", r.photo, "photo.jpg");
+  form.append("thumb", r.thumb, "thumb.jpg");
+  form.append("w", String(r.w));
+  form.append("h", String(r.h));
+  if (r.time.taken_at) form.append("taken_at", r.time.taken_at);
+  form.append("taken_at_source", r.time.taken_at_source);
+  const { status, body } = await post(it, form);
+  it.xhr = null;
+  active--;
+  if (stopped) return;
+  const err = body && body.error;
+
+  if (status === 201) {
+    sentAt.push(Date.now());
+    it.ready = null;
+    it.bytes = 0;
+    setState(it, "done");
+    info.count = body && typeof body.count === "number" ? body.count : info.count + 1;
+    renderCount(true);
+  } else if (status === 404 || status === 410) {
+    return stop(status === 404 ? "unknown_token" : "expired");
+  } else if (status === 415 || status === 413) {
+    it.ready = null;
+    setState(it, "bad");
+  } else if (status === 429 && err === "photo_limit") {
+    setState(it, "ready");
+    albumFull();
+  } else if (status === 429 && err === "rate_limited" && ++it.rateHits <= MAX_RATE_HITS) {
+    // 다른 가족도 같은 링크로 올리는 중일 수 있다: 모두 잠깐 쉬고 같은 사진을 다시 보낸다
+    holdUntil = Math.max(holdUntil, Date.now() + SERVER_HOLD_MS);
+    setState(it, "ready");
+  } else if (it.tries < RETRIES) {
+    // 연결 끊김·시간 초과·서버 오류: 잠깐 뒤에 다시
+    const delay = RETRY_DELAYS[it.tries++];
+    setState(it, "waiting");
+    setTimeout(() => {
+      if (it.state === "waiting") {
+        setState(it, "ready");
+        pump();
+      }
+    }, delay);
+  } else {
+    setState(it, "failed");
   }
-  $("grid").replaceChildren(...tiles);
+  pump();
+  prepLoop();
 }
 
-function showThumb(f, blob) {
-  if (!f.el) return;
-  const url = URL.createObjectURL(blob);
-  thumbUrls.push(url);
-  const img = document.createElement("img");
-  img.alt = "";
-  img.src = url;
-  f.el.className = "";
-  f.el.replaceChildren(img);
+function retry(it) {
+  if (it.state !== "failed" || stopped) return;
+  it.tries = 0;
+  it.rateHits = 0;
+  finishedShown = false;
+  setState(it, it.ready ? "ready" : "queued");
+  acquireWakeLock();
+  pump();
+  prepLoop();
 }
 
-function clearFiles() {
-  for (const url of thumbUrls) URL.revokeObjectURL(url);
-  thumbUrls = [];
-  files = [];
-}
-
-function mark(f, state) {
-  if (!f.el) return;
-  f.el.className = state;
-  if (state === "bad" || state === "failed") {
-    const span = document.createElement("span");
-    span.textContent = state === "bad" ? "이 사진은 열 수 없어요" : "보내지 못했어요";
-    f.el.append(span);
-    f.el.className = "bad";
+/** 여행당 200장이 찼다: 아직 못 보낸 사진은 자리가 없다고 표시하고 멈춘다 */
+function albumFull() {
+  for (const it of items) {
+    if (["queued", "preparing", "ready", "waiting", "failed"].includes(it.state)) {
+      it.ready = null;
+      setState(it, "noroom");
+    }
   }
 }
 
-function progress(done, total) {
-  $("progress").hidden = false;
-  $("barFill").style.width = `${Math.round((done / total) * 100)}%`;
-  $("progressText").textContent = `${total}장 중 ${done}장`;
+function stop(code) {
+  stopped = code;
+  for (const it of items) it.xhr?.abort();
+  clearTimeout(pumpTimer);
+  showError(code);
 }
 
-$("file").addEventListener("change", (e) => {
-  if (busy) return;
-  clearFiles();
-  files = [...e.target.files].map((file) => ({ file, el: null }));
-  $("done").hidden = true;
-  $("progress").hidden = true;
-  renderGrid();
-  $("send").disabled = files.length === 0;
-  $("send").textContent = files.length ? `${files.length}장 여로 앨범에 올리기` : "여로 앨범에 올리기";
-});
+// ---------- 고르기 ----------
 
-$("send").addEventListener("click", async () => {
-  if (busy || files.length === 0) return;
-  busy = true;
-  $("send").disabled = true;
-  $("pick").hidden = true;
-  const total = files.length;
-  let sent = 0;
-  let stop = null;
-  progress(0, total);
-  for (let k = 0; k < total; k++) {
-    const result = await send(files[k]);
-    if (result === "ok") sent++;
-    if (result === "ok" || result === "bad" || result === "failed") {
-      mark(files[k], result === "ok" ? "done" : result);
-      renderHeader();
-      progress(k + 1, total);
+function roomLeft() {
+  const pending = items.filter((i) => !["done", "bad", "noroom"].includes(i.state)).length;
+  return info.max - info.count - pending;
+}
+
+function addFiles(files) {
+  if (!files.length || stopped) return;
+  const known = new Set(items.map((i) => i.key));
+  let dup = 0;
+  const fresh = [];
+  for (const file of files) {
+    const key = `${file.name}|${file.size}|${file.lastModified}`;
+    if (known.has(key)) {
+      dup++;
       continue;
     }
-    stop = result;
-    break;
+    known.add(key);
+    fresh.push({ file, key });
   }
-  busy = false;
-  $("file").value = ""; // 같은 사진을 다시 골라도 change가 일어나게
-  if (stop) return showError(stop);
-  $("done").textContent = sent === total
-    ? `${total}장 모두 보냈어요. 차가 앨범의 제자리에 넣을게요.`
-    : `${total}장 중 ${sent}장을 보냈어요. 차가 앨범의 제자리에 넣을게요.`;
-  $("done").hidden = false;
-  $("pick").hidden = false;
-  $("send").textContent = "여로 앨범에 올리기";
-  files = []; // 썸네일은 그리드에 남겨 두고, URL은 다음에 고를 때 revoke한다
+  const room = Math.max(0, roomLeft());
+  const over = Math.max(0, fresh.length - room);
+  const take = fresh.slice(0, room);
 
+  const frag = document.createDocumentFragment();
+  for (const { file, key } of take) {
+    const it = { n: ++seq, file, key, state: "queued", ready: null, bytes: 0, progress: 0, tries: 0, rateHits: 0, el: null, xhr: null };
+    it.el = makeTile(it);
+    items.push(it);
+    frag.append(it.el.parentNode);
+  }
+  $("grid").append(frag);
+  $("empty").hidden = true;
+  $("lead").hidden = true;
+  finishedShown = false;
+  $("finish").hidden = true;
+
+  const notes = [];
+  if (over) notes.push(`이 여행에는 사진을 ${info.max}장까지 올릴 수 있어서 ${over}장은 뺐어요.`);
+  if (dup) notes.push(`이미 고른 사진 ${dup}장은 한 번만 보내요.`);
+  if (notes.length) toast(notes.join(" "), 4200);
+  if (take.length) {
+    acquireWakeLock();
+    prepLoop();
+  }
+  updateStatus();
+}
+
+function openPicker() {
+  if (stopped) return;
+  const input = $("file");
+  input.value = ""; // 같은 사진을 다시 골라도 change가 일어나게
+  input.click();
+}
+
+$("pick").addEventListener("click", openPicker);
+$("empty").addEventListener("click", openPicker);
+$("empty").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    openPicker();
+  }
 });
+$("file").addEventListener("change", (e) => {
+  const picked = Array.from(e.target.files || []); // 값을 비우기 전에 먼저 복사한다
+  e.target.value = "";
+  addFiles(picked);
+});
+
+// ---------- 칸 ----------
+
+const RING_C = 113.1; // 2πr, r = 18
+
+function makeTile(it) {
+  const li = document.createElement("li");
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "tile queued";
+  b.setAttribute("aria-label", `사진 ${it.n}, 기다리는 중`);
+  b.innerHTML =
+    '<img alt="" decoding="async"><span class="veil"></span>' +
+    '<svg class="ring" viewBox="0 0 44 44" aria-hidden="true"><circle class="track" cx="22" cy="22" r="18"/><circle class="arc" cx="22" cy="22" r="18"/></svg>' +
+    '<span class="check" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="m5 12.5 4.5 4.5L19 7.5" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>' +
+    '<span class="badge" aria-hidden="true"></span>';
+  if (!reduceMotion) b.style.animationDelay = `${Math.min(items.length % 12, 11) * 25}ms`;
+  b.addEventListener("click", () => retry(it));
+  li.append(b);
+  return b;
+}
+
+function showTile(it, blob) {
+  const img = it.el.querySelector("img");
+  img.onload = () => it.el.classList.add("has-img");
+  img.src = URL.createObjectURL(blob); // 작은 그림(≈20KB)이라 페이지가 열려 있는 동안 둔다
+}
+
+const LABEL = {
+  queued: "기다리는 중", preparing: "준비하는 중", ready: "곧 보내요", uploading: "보내는 중", waiting: "잠깐 쉬는 중",
+  done: "보냈어요", failed: "보내지 못했어요. 누르면 다시 보내요", bad: "열 수 없는 사진", noroom: "자리가 없어요",
+};
+
+function setState(it, state) {
+  it.state = state;
+  const el = it.el;
+  const keep = el.classList.contains("has-img");
+  el.className = `tile ${state === "ready" ? "queued" : state}${keep ? " has-img" : ""}`;
+  el.setAttribute("aria-label", `사진 ${it.n}, ${LABEL[state]}`);
+  el.disabled = state !== "failed";
+  const badge = el.querySelector(".badge");
+  if (state === "failed") {
+    badge.innerHTML =
+      '<span class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span>다시 보내기';
+  } else if (state === "bad") {
+    badge.textContent = "열 수 없는 사진";
+  } else if (state === "noroom") {
+    badge.textContent = "자리가 없어요";
+  } else if (badge.firstChild) {
+    badge.textContent = "";
+  }
+  if (state === "done") setRing(it, 1);
+}
+
+function setProgress(it, f) {
+  it.progress = f;
+  setRing(it, f * 0.92); // 다 올라가도 서버 답을 받을 때까지는 조금 남겨 둔다
+  scheduleStatus();
+}
+
+function setRing(it, f) {
+  const arc = it.el.querySelector(".arc");
+  arc.style.strokeDashoffset = String(RING_C * (1 - Math.max(0, Math.min(1, f))));
+}
+
+// ---------- 위 진행 상황 · 끝 ----------
+
+let statusQueued = false;
+function scheduleStatus() {
+  if (statusQueued) return;
+  statusQueued = true;
+  requestAnimationFrame(() => {
+    statusQueued = false;
+    updateStatus();
+  });
+}
+
+const count = (state) => items.reduce((s, i) => s + (i.state === state ? 1 : 0), 0);
+const BUSY = ["queued", "preparing", "ready", "uploading", "waiting"];
+
+function updateStatus() {
+  if (!items.length || stopped) return;
+  const done = count("done");
+  const bad = count("bad");
+  const noroom = count("noroom");
+  const failed = count("failed");
+  const total = items.length - bad - noroom;
+  const busy = items.some((i) => BUSY.includes(i.state));
+  const inflight = items.reduce((s, i) => s + (i.state === "uploading" ? i.progress * 0.92 : 0), 0);
+
+  $("status").hidden = !busy; // 끝나면 아래 끝 카드가 대신 말한다
+  $("pickLabel").textContent = "더 고르기";
+  const pct = total ? Math.min(100, Math.round(((done + inflight) / total) * 100)) : 100;
+  $("barFill").style.width = `${pct}%`;
+  $("statusPct").textContent = `${pct}%`;
+  $("statusTitle").innerHTML = total
+    ? `${total}장 중 <em>${done}장</em> 보냈어요`
+    : "보낼 수 있는 사진이 없어요";
+
+  let hint = "";
+  let wait = false;
+  if (busy) {
+    const w = active === 0 && items.some((i) => i.state === "ready") ? rateWait() : 0;
+    if (w > 1500) {
+      wait = true;
+      hint = `사진이 많아서 잠깐 숨을 고르는 중이에요. ${Math.ceil(w / 1000)}초 뒤에 이어서 보내요.`;
+    } else if (!navigator.onLine) {
+      wait = true;
+      hint = "인터넷 연결을 기다리고 있어요.";
+    } else {
+      hint = "보내는 동안 이 화면을 켜 두세요. 더 골라도 뒤에 이어서 보내요.";
+    }
+  } else if (failed) {
+    hint = `${failed}장은 보내지 못했어요. 사진을 누르면 다시 보내요.`;
+  }
+  $("statusHint").textContent = hint;
+  $("statusHint").hidden = !hint;
+  $("statusHint").classList.toggle("wait", wait);
+
+  // 쉬는 동안 남은 초를 세어 준다
+  if (busy && !tickTimer) tickTimer = setInterval(updateStatus, 1_000);
+  if (!busy && tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = 0;
+  }
+
+  if (busy) {
+    $("finish").hidden = true;
+    finishedShown = false;
+  } else if (!finishedShown) {
+    finishedShown = true;
+    showFinish({ done, bad, noroom, failed });
+    releaseWakeLock();
+  }
+}
+
+const CHECK_SVG = '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ALERT_SVG = '<svg width="30" height="30" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+function showFinish({ done, bad, noroom, failed }) {
+  const box = $("finish");
+  const extra = [];
+  if (bad) extra.push(`열 수 없는 사진 ${bad}장은 빼고 보냈어요.`);
+  if (noroom) extra.push(`이 여행에는 사진을 ${info.max}장까지 올릴 수 있어서 ${noroom}장은 못 보냈어요.`);
+  box.classList.toggle("partial", failed > 0);
+  if (failed) {
+    $("finishIcon").innerHTML = ALERT_SVG;
+    $("finishTitle").textContent = done ? `${done}장을 보냈어요` : "아직 보내지 못했어요";
+    $("finishBody").textContent = [`${failed}장은 보내지 못했어요. 인터넷이 잘 되는 곳에서 다시 보내 주세요.`, ...extra].join(" ");
+  } else {
+    $("finishIcon").innerHTML = CHECK_SVG;
+    $("finishTitle").textContent = done ? "다 보냈어요!" : "보낸 사진이 없어요";
+    $("finishBody").textContent = done
+      ? [`${done}장이 여행 앨범으로 갔어요. 차가 앨범의 제자리에 넣을게요.`, ...extra].join(" ")
+      : extra.join(" ") || "다른 사진을 골라 주세요.";
+  }
+  $("retryAll").hidden = failed === 0;
+  box.querySelectorAll(".spark").forEach((s) => s.remove());
+  if (!failed && done && !reduceMotion) sparkle(box);
+  box.hidden = false;
+  // 다시 그리면 들어오는 움직임이 다시 돈다
+  box.style.animation = "none";
+  void box.offsetWidth;
+  box.style.animation = "";
+  const top = box.getBoundingClientRect().top;
+  if (top < 0 || top > innerHeight - 200) box.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+}
+
+function sparkle(box) {
+  const colors = ["#FFB46A", "#FFCF9A", "#F4F1EA", "#FF9F4A"];
+  for (let k = 0; k < 14; k++) {
+    const s = document.createElement("i");
+    s.className = "spark";
+    const a = (k / 14) * Math.PI * 2;
+    const r = 70 + (k % 3) * 22;
+    s.style.left = "50%";
+    s.style.top = "58px";
+    s.style.background = colors[k % colors.length];
+    s.style.setProperty("--dx", `${Math.round(Math.cos(a) * r)}px`);
+    s.style.setProperty("--dy", `${Math.round(Math.sin(a) * r * 0.7)}px`);
+    s.style.animationDelay = `${150 + (k % 4) * 40}ms`;
+    box.append(s);
+  }
+}
+
+$("retryAll").addEventListener("click", () => {
+  for (const it of items) if (it.state === "failed") retry(it);
+});
+
+// ---------- 가족에게 링크 보내기 ----------
+
+function shareLink() {
+  return `${location.origin}${location.pathname}?t=${encodeURIComponent(token)}`;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;left:-1000px;top:0;opacity:0";
+    document.body.append(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    ta.remove();
+    return ok;
+  }
+}
+
+$("share").addEventListener("click", async () => {
+  const url = shareLink();
+  const dest = (info && info.dest_name) || "우리 가족";
+  const data = {
+    title: `${dest} 여행 사진 올리기`,
+    text: `${dest} 여행에서 찍은 사진을 여기에 올려 주세요. 차가 여행 앨범에 넣어 줘요.`,
+    url,
+  };
+  if (navigator.share && (!navigator.canShare || navigator.canShare(data))) {
+    try {
+      await navigator.share(data);
+      return;
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // 사용자가 닫았다
+    }
+  }
+  if (await copyText(url)) toast("링크를 복사했어요. 카카오톡 대화창에 붙여 넣어 주세요.");
+  else toast(url, 6000);
+});
+
+let toastTimer = 0;
+function toast(text, ms = 2800) {
+  const t = $("toast");
+  t.textContent = text;
+  t.classList.add("on");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("on"), ms);
+}
+
+// ---------- 화면 켜 두기 · 떠나기 경고 ----------
+
+let wakeLock = null;
+async function acquireWakeLock() {
+  try {
+    if (!wakeLock && "wakeLock" in navigator && document.visibilityState === "visible") {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    }
+  } catch {
+    wakeLock = null;
+  }
+}
+function releaseWakeLock() {
+  try {
+    wakeLock?.release();
+  } catch {
+    // 무시
+  }
+  wakeLock = null;
+}
+const isBusy = () => items.some((i) => BUSY.includes(i.state));
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && isBusy()) {
+    acquireWakeLock();
+    pump();
+  }
+});
+addEventListener("online", () => pump());
+addEventListener("beforeunload", (e) => {
+  if (isBusy() && !stopped) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+
+$("reload").addEventListener("click", () => location.reload());
 
 loadInfo();
